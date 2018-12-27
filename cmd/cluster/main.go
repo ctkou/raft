@@ -16,6 +16,8 @@ func main() {
     return
   }
 
+  // start a cluster with the specfied number of nodes
+  // start api to handle client request
   api.StartAPI(port, nodeCount)
 }
 
