@@ -24,12 +24,6 @@ type Node struct {
   Applied int
 }
 
-// // perform log replication
-// func (node *Node) ReplicateLog(followerId int) {
-//   // TODO
-//   return
-// }
-
 /**
  *  Listen for incoming message on the node's address and port
  *  
@@ -41,135 +35,56 @@ func (node *Node) Listen() (err error) {
   return
 }
 
+/**
+ *  Close the node's address and port from accepting further messages
+ */
 func (node *Node) Close() {
   node.server.Close()
   return
 }
 
-type Leader struct {
-  Next map[int]int
-  Match map[int]int
-  *Node
-}
-
-func NewLeader(id int, address string, peerNodes map[int]string,
-               currentTerm int, votedFor *int, log []LogEntry, commit int,
-               applied int, next map[int]int, match map[int]int) *Leader {
-  return &Leader{next,
-                 match,
-                 &Node{NewUDPServer(address), id, address, peerNodes,
-                       currentTerm, votedFor, log, commit, applied}}
-}
-
 /**
- *  Send an AppendEntries message to the specified follower
+ *  send a RAFT protocol message
  *  - ctx : context for which caller of this method may choose to set timeout
- *          deadline for the AppendEntries
- *  - followerId : follower to send the AppendEntries message to
- *
- *  return
- *  - err : error for sending the AppendEntries message
+ *          deadline for sending the RAFT protocol message
+ *  - address : address to send the RAFT protocol message to
+ *  - data : RAFT protocol message struct (see message.go)
  */
-func (leader *Leader) SendAppendEntries(ctx context.Context, followerId int) (err error) {
-  payload, err := leader.getAppendEntriesMessage(followerId)
+func (node *Node) send(ctx context.Context, address string, data interface{}) (err error) {
+  payload, err := json.Marshal(data)
   if err != nil {
     return
   }
-  followerAddress := leader.PeerNodes[followerId]
-  _, err = leader.server.Send(ctx, followerAddress, payload)
+  _, err = node.server.Send(ctx, address, payload)
   return
 }
 
 /**
- * return the AppendEntries message, the message include the current term of master, master id,
- * previous log index and log term of the follower, index of last log entry known to be 
- * committed, and log entries starting from previous log index + 1
- * - followerId : for extracting the previous log index and previous log term for the follower
- *
- * return
- * - payload : json representation of the AppendEntries message
- * - error : possible error when constructing the payload
- */
-func (leader *Leader) getAppendEntriesMessage(followerId int) (payload []byte, err error) {
-  prevLogIndex := leader.Match[followerId] // this is one-indexed
-  prevLogTerm := 0
-  if prevLogIndex > 0 {
-    prevLogTerm = leader.Log[prevLogIndex - 1].Term
-  }
-  payload, err = json.Marshal(AppendEntries{leader.CurrentTerm,
-                                            leader.Id,
-                                            prevLogIndex,
-                                            prevLogTerm,
-                                            leader.Commit,
-                                            leader.Log[prevLogIndex:]})
-  return
-}
-
-/**
- *  Receive an AppendEntriesResult message from follower
- * 
+ *  Receive a RAFT protocol message
  *  - ctx : context for which caller of this method may choose to set timeout
- *          deadline for the AppendEntries
- *  - buffer : buffer to write the AppendEntriesResult packet to
+ *          deadline for receiving the RAFT protocol message
+ *  - buffer : buffer to write the RAFT protocol message packet to
+ *  - data : pointer to RAFT protocol message struct (see message.go)
  *
  *  return
- *  - followerAddress : address of the follower that the AppendEntriesResult originates
- *  - err : err from receiving AppendEntriesResult
+ *  - address : address of the RAFT protocol message originates
+ *  - err : error, if any, from receiving the RAFT protocol message
  */
-func (leader *Leader) ReceiveAppendEntriesResult(ctx context.Context, buffer []byte) (followerAddress string, result AppendEntriesResult, err error) {
-  err = leader.server.Listen()
+func (node *Node) receive(ctx context.Context, buffer []byte, data interface{}) (address string, err error) {
+  err = node.server.Listen()
   if err != nil {
     return
   }
   done := make(chan bool, 1)
   go func() {
-    byteReceived, clientAddress, serverErr := leader.server.Receive(ctx, buffer)
+    byteReceived, clientAddress, serverErr := node.server.Receive(ctx, buffer)
     if serverErr != nil {
       err = serverErr
       done <-true
       return
     }
-    followerAddress = clientAddress
-    err = json.Unmarshal(buffer[:byteReceived], &result)
-    done <-true
-  } ()
-  select {
-  case <-ctx.Done():
-    err = ctx.Err()
-  case <-done:
-  }
-  return
-}
-
-type Follower struct {
-  *Node
-}
-
-func NewFollower(id int, address string, peerNodes map[int]string, currentTerm int, votedFor *int, log []LogEntry, commit int, applied int) *Follower {
-  return &Follower{&Node{NewUDPServer(address), id, address, peerNodes, currentTerm, votedFor, log, commit, applied}}
-}
-
-/**
- *  Receive AppendEntries message from master
- *  - ctx : context for which caller of this method may choose to set timeout
- *          deadline for the AppendEntries
- *  - buffer : buffer to write the AppendEntries packet to
- */
-func (follower *Follower) ReceiveAppendEntries(ctx context.Context, buffer []byte) (masterAddress string, appendEntries AppendEntries, err error) {
-  err = follower.server.Listen()
-  if err != nil {
-    return
-  }
-  done := make(chan bool, 1)
-  go func() {
-    byteReceived, clientAddress, serverErr := follower.server.Receive(ctx, buffer)
-    if serverErr != nil {
-      err = serverErr
-      done <- true
-      return
-    }
-    masterAddress = clientAddress
-    err = json.Unmarshal(buffer[:byteReceived], &appendEntries)
+    address = clientAddress
+    err = json.Unmarshal(buffer[:byteReceived], &data)
     done <-true
   } ()
   select {
@@ -181,52 +96,31 @@ func (follower *Follower) ReceiveAppendEntries(ctx context.Context, buffer []byt
 }
 
 /**
- *  Send an AppendEntriesResult message to the master
+ *  Receive an RequestVote message from a candidate
  *  - ctx : context for which caller of this method may choose to set timeout
- *          deadline for the AppendEntriesResult
- *  - masterAddress : master address to send the AppendEntriesResult message to
- *  - success : true if the original AppendEntries was accepted
+ *          deadline for receiving the RequestVote message
+ *  - buffer : buffer to write the RequestVote packet to
  *
  *  return
- *  - err : error for sending the AppendEntriesResult message
+ *  - candidateAddress : address of the candidate that the RequestVote message originates
+ *  - request : the RequestVote message received from the candidate
+ *  - err : error, if any, from receiving the RequestVote message
  */
-func (follower *Follower) SendAppendEntriesResult(ctx context.Context, masterAddress string, success bool) (err error) {
-  payload, err := follower.getAppendEntriesResultMessage(success)
-  if err != nil {
-    return
-  }
-  _, err = follower.server.Send(ctx, masterAddress, payload)
+func (node *Node) ReceiveRequestVote(ctx context.Context, buffer []byte) (candidateAddress string, request RequestVote, err error) {
+  candidateAddress, err = node.receive(ctx, buffer, &request)
   return
 }
 
 /**
- * return the AppendEntriesResult message, the message include the current term
- * of master, master id, previous log index and log term of the follower, index
- * of last log entry known to be committed, and log entries starting from 
- * previous log index + 1
- * - followerId : for extracting the previous log index and previous log term 
- *                for the follower
+ *  Send a RequestVoteResult message to the specified candidate
+ *  - ctx : context for which caller of this method may choose to set timeout
+ *          deadline for sending the RequestVoteResult message
+ *  - peerId : peer Id to send the RequestVoteResult message to
+ *  - voteGranted : true if vote is to be granted to the specified peer
  *
- * return
- * - payload : json representation of the AppendEntries message
- * - error : possible error when constructing the payload
+ *  return
+ *  - err : error for sending the RequestVoteResult message
  */
-func (follower *Follower) getAppendEntriesResultMessage(success bool) (payload []byte, err error) {
-  payload, err = json.Marshal(AppendEntriesResult{follower.CurrentTerm, success})
-  return
+func (node *Node) SendRequestVoteResult(ctx context.Context, peerId int, voteGranted bool) (err error) {
+  return node.send(ctx, node.PeerNodes[peerId], RequestVoteResult{node.CurrentTerm, voteGranted})
 }
-
-/*
-  // check if the term in AppendEntries is less than the current one
-  if appendEntriesMessage.Term < node.CurrentTerm {
-    return AppendEntriesResult{node.CurrentTerm, false}, nil
-  }
-  // check if the current log contains an entry at prevLogIndex whose term matches prevLogTerm
-  prevLogIndex := appendEntriesMessage.PrevLogIndex // one-indexed
-  prevLogTerm := appendEntriesMessage.PrevLogTerm
-  if len(node.Log) < prevLogIndex || (len(node.Log) > 0 && node.Log[prevLogIndex - 1].Term != prevLogTerm) {
-    return AppendEntriesResult{node.CurrentTerm, false}, nil
-  }
-  // update log accordingly
-  return AppendEntriesResult{appendEntriesMessage.Term, true}, nil
-*/
